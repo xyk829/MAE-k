@@ -22,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+from torch_optimizer import RAdam
 
 import timm
 
@@ -32,8 +33,10 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
+import models_bs_mae
 
-from engine_pretrain import train_one_epoch
+from engine_pretrain import train_one_epoch, train_one_bs_epoch
+import math
 
 
 def get_args_parser():
@@ -101,9 +104,23 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    parser.add_argument('--mae_num', default=1, type=int,
+                        help='number of bootstrap samples for MAE')
+    parser.add_argument('--ema', action='store_true',
+                        help='use EMA method in training')
+    parser.add_argument('--half_life', default=2, type=float,
+                        help='half life of EMA')
+    parser.add_argument('--feature_depth', default=12, type=int,
+                        help='feature extract in encoder')
 
     return parser
 
+def update_ema(ema_model, mae_model, half_life):
+    decay = math.exp(-math.log(2) / half_life)
+    with torch.no_grad():
+        for ema_param, model_param in zip(ema_model.parameters(), mae_model.parameters()):
+            model_param = model_param.to(ema_param.device)
+            ema_param.mul_(decay).add_(model_param, alpha=1 - decay)
 
 def main(args):
     misc.init_distributed_mode(args)
@@ -120,18 +137,11 @@ def main(args):
 
     cudnn.benchmark = True
 
-    # simple augmentation
-    # transform_train = transforms.Compose([
-    #         transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
-    #         transforms.RandomHorizontalFlip(),
-    #         transforms.ToTensor(),
-    #         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     transform_train =  transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010])])
-    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     dataset_train = torchvision.datasets.CIFAR10('data', train=True, download=True, transform=transform_train)
     print(dataset_train)
 
@@ -184,15 +194,18 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = RAdam(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
+    mae_num = args.mae_num
+    mae_epochs = args.epochs // mae_num
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch, mae_epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
@@ -201,8 +214,8 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
+        if args.output_dir and (epoch + 1 == mae_epochs):
+            last_model_path = misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
@@ -214,11 +227,63 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+    
+    if args.ema:
+        ema_model = models_bs_mae.__dict__["deitencoder"](pretrained_encoder=last_model_path)
+    
+    for cnt in range(1, mae_num):
+        if args.ema:
+            mae_model = models_bs_mae.__dict__["deitencoder"](pretrained_encoder=last_model_path)
+            update_ema(ema_model, mae_model, args.half_life)
+            teacher_model = ema_model
+        else:
+            teacher_model = models_bs_mae.__dict__["deitencoder"](pretrained_encoder=last_model_path)            
+        model_two = models_bs_mae.__dict__["deittiny"](norm_pix_loss=args.norm_pix_loss, pretrained_encoder=last_model_path)
+
+        model_two.to(device)
+
+        model_without_ddp_two = model_two
+        print("Model = %s" % str(model_without_ddp_two))
+        
+        if args.distributed:
+            model_two = torch.nn.parallel.DistributedDataParallel(model_two, device_ids=[args.gpu], find_unused_parameters=True)
+            model_without_ddp_two = model_two.module
+        
+        # following timm: set wd as 0 for bias and norm layers
+        param_groups = optim_factory.add_weight_decay(model_without_ddp_two, args.weight_decay)
+        # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+        optimizer = RAdam(param_groups, lr=args.lr, betas=(0.9, 0.95))
+        print(optimizer)
+        loss_scaler = NativeScaler()
+
+        misc.load_model(args=args, model_without_ddp=model_without_ddp_two, optimizer=optimizer, loss_scaler=loss_scaler)
+
+        for epoch in range(args.start_epoch, mae_epochs):
+            if args.distributed:
+                data_loader_train.sampler.set_epoch(epoch)
+            train_stats = train_one_bs_epoch(
+                model_two, data_loader_train, teacher_model,
+                optimizer, device, epoch, loss_scaler,
+                log_writer=log_writer,
+                args=args
+            )
+            if args.output_dir and (epoch + 1 == mae_epochs):
+                last_model_path = misc.save_model(
+                    args=args, model=model_two, model_without_ddp=model_without_ddp_two, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, k=cnt)
+
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            'epoch': epoch,}
+
+            if args.output_dir and misc.is_main_process():
+                if log_writer is not None:
+                    log_writer.flush()
+                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
 
 if __name__ == '__main__':
     args = get_args_parser()

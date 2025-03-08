@@ -1,0 +1,1 @@
+python3 submitit_finetune.py --nodes 1 --ngpus 2 --batch_size 512 --model deit_tiny_patch4 --finetune ../checkpoint/experiments/1098039/checkpoint3-49.pth --epochs 80 --blr 1e-2 --layer_decay 0.65 --weight_decay 0.05 --drop_path 0.1 --reprob 0.25 --mixup 0.8 --cutmix 1.0

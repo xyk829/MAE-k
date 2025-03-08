@@ -63,3 +63,23 @@ def build_transform(is_train, args):
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(mean, std))
     return transforms.Compose(t)
+
+def cifar_build_transform(is_train, args):
+    # CIFAR-10 数据集的均值和标准差
+    mean = [0.4914, 0.4822, 0.4465]
+    std = [0.2023, 0.1994, 0.2010]
+
+    if is_train:
+        transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),  # 随机裁剪为32x32，填充4像素
+            transforms.RandomHorizontalFlip(),     # 随机水平翻转
+            transforms.ToTensor(),                 # 转换为张量
+            transforms.Normalize(mean, std),       # 标准化
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+    return transform

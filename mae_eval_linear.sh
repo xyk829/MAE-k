@@ -1,0 +1,1 @@
+python3 submitit_linprobe.py --nodes 1 --ngpus 2 --batch_size 1024 --nb_classes 10 --model deit_tiny_patch4 --cls_token --finetune  ../checkpoint/experiments/461758/checkpoint-199.pth --epochs 100 --blr 0.3 --weight_decay 0.0
